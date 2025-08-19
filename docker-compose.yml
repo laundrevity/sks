@@ -1,0 +1,22 @@
+services:
+  web:
+    build:
+      context: .
+    image: sveltekit-dev:local
+    working_dir: /app
+    # Start the dev server by default via entrypoint CMD "dev"
+    command: dev
+    ports:
+      - "5173:5173"
+    environment:
+      # Keep infra deterministic; allow lock mutation only when you explicitly toggle it.
+      - AUTO_UPDATE_LOCK=0
+      - HOST=0.0.0.0
+      - PORT=5173
+    volumes:
+      - ./:/app:rw
+      - node_modules_cache:/app/node_modules
+
+volumes:
+  node_modules_cache:
+
