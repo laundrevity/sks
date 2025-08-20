@@ -17,6 +17,12 @@
 		"test:e2e": "playwright test"
 	},
 	"devDependencies": {
+		"@tailwindcss/forms": "0.5.9",
+		"@tailwindcss/typography": "0.5.15",
+		"autoprefixer": "10.4.20",
+		"postcss": "8.4.49",
+		"prettier-plugin-tailwindcss": "0.6.9",
+		"tailwindcss": "3.4.14",
 		"@eslint/compat": "^1.2.5",
 		"@eslint/js": "^9.18.0",
 		"@playwright/test": "^1.49.1",
@@ -40,3 +46,4 @@
 		"vitest-browser-svelte": "^0.1.0"
 	}
 }
+

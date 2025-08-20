@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Tiny semantic helpers (keeps markup crisp) */
+.bubble { @apply max-w-[75ch] rounded-2xl px-4 py-3 border shadow-soft whitespace-pre-wrap; }
+.bubble-user { @apply bubble bg-slate-800 border-slate-700; }
+.bubble-asst { @apply bubble bg-slate-900 border-slate-800; }
+

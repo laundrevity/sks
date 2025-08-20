@@ -1,65 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Config ---
-APP_DIR="/app"
-RUN_AS="node"   # drop privileges after setup
-HOST="0.0.0.0"  # Vite/SvelteKit host binding
-PORT="${PORT:-5173}"
-
-# Ensure dirs exist and are writeable by non-root
-mkdir -p "${APP_DIR}/node_modules"
-chown -R ${RUN_AS}:${RUN_AS} "${APP_DIR}"
-
-# npm cache dir (lives in the container user’s home)
-su -s /bin/bash -c "mkdir -p ~/.npm" ${RUN_AS}
-
-cd "${APP_DIR}"
-
-# If there's no package.json yet (brand-new repo), do nothing special;
-# you can still run the scaffolder inside the container.
-if [[ ! -f package.json ]]; then
-  echo "No package.json found. Skip install. (You can scaffold with: npx sv@latest create .)"
-else
-  # We prefer exact versions from lockfile when present.
-  if [[ -f package-lock.json ]]; then
-    echo "Lockfile detected. Running: npm ci"
-    if ! gosu ${RUN_AS} npm ci; then
-      echo "npm ci failed (lock mismatch?)."
-      if [[ "${AUTO_UPDATE_LOCK:-0}" == "1" ]]; then
-        echo "AUTO_UPDATE_LOCK=1 -> running 'npm install' to reconcile lockfile."
-        gosu ${RUN_AS} npm install
-      else
-        echo "Refusing to mutate lockfile. Set AUTO_UPDATE_LOCK=1 to allow 'npm install'."
-        exit 1
-      fi
-    fi
+# Drop privileges helper
+run_as_node() {
+  if [ "$(id -u)" = "0" ]; then
+    exec gosu node "$@"
   else
-    echo "No lockfile. Running initial 'npm install' to create package-lock.json"
-    gosu ${RUN_AS} npm install
+    exec "$@"
   fi
+}
+
+# Ensure ownership of /app and node_modules cache (when running as root initially)
+if [ "$(id -u)" = "0" ]; then
+  chown -R node:node /app || true
+  chown -R node:node /app/node_modules || true
 fi
 
-# Commands:
-#  - dev  : start dev server
-#  - build: production build
-#  - preview: preview built app
-cmd="${1:-dev}"
+# Install dependencies deterministically if needed
+LOCK="/app/package-lock.json"
+NM="/app/node_modules"
+STAMP="/app/.lockhash"
 
-case "${cmd}" in
-  dev)
-    exec gosu ${RUN_AS} npm run dev -- --host "${HOST}" --port "${PORT}"
-    ;;
-  build)
-    exec gosu ${RUN_AS} npm run build
-    ;;
-  preview)
-    exec gosu ${RUN_AS} npm run preview -- --host "${HOST}" --port "${PORT}"
-    ;;
-  *)
-    # allow arbitrary commands, e.g. "bash"
-    shift || true
-    exec gosu ${RUN_AS} "${cmd}" "$@"
-    ;;
+calc_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$LOCK" | awk '{print $1}'
+  else
+    # fallback for alpine/busybox if you ever swap base
+    openssl dgst -sha256 "$LOCK" | awk '{print $2}'
+  fi
+}
+
+needs_install=0
+if [ ! -d "$NM" ]; then
+  needs_install=1
+elif [ ! -f "$STAMP" ]; then
+  needs_install=1
+else
+  current="$(calc_hash)"
+  previous="$(cat "$STAMP" || true)"
+  [ "$current" != "$previous" ] && needs_install=1 || needs_install=0
+fi
+
+if [ "$needs_install" -eq 1 ]; then
+  if [ "${AUTO_UPDATE_LOCK:-0}" != "0" ]; then
+    echo "AUTO_UPDATE_LOCK=1 -> refusing to mutate lock; using npm ci strictly."
+  fi
+  echo "Installing deps with npm ci..."
+  if [ "$(id -u)" = "0" ]; then
+    gosu node npm ci --no-audit --no-fund
+  else
+    npm ci --no-audit --no-fund
+  fi
+  calc_hash > "$STAMP"
+fi
+
+# Run the requested command as node user
+case "${1:-dev}" in
+  dev)      run_as_node npm run dev ;;
+  build)    run_as_node npm run build ;;
+  preview)  run_as_node npm run preview -- --host 0.0.0.0 --port "${PORT:-5173}" ;;
+  *)        run_as_node "$@" ;;
 esac
 

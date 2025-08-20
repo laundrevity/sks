@@ -1,21 +1,37 @@
 services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: sks-api:local
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LOG_LEVEL=INFO
+      - PORT=8000
+      - HOST=0.0.0.0
+    ports:
+      - "8000:8000"
+
   web:
     build:
       context: .
     image: sveltekit-dev:local
     working_dir: /app
-    # Start the dev server by default via entrypoint CMD "dev"
-    command: dev
+    # ⬇️ force vite to bind to all interfaces
+    command: sh -lc 'npm run dev -- --host 0.0.0.0 --port 5173'
     ports:
       - "5173:5173"
     environment:
-      # Keep infra deterministic; allow lock mutation only when you explicitly toggle it.
       - AUTO_UPDATE_LOCK=0
       - HOST=0.0.0.0
       - PORT=5173
+      - VITE_API_BASE=http://localhost:8000
+      - API_BASE=http://api:8000
     volumes:
       - ./:/app:rw
       - node_modules_cache:/app/node_modules
+    depends_on:
+      - api
 
 volumes:
   node_modules_cache:
