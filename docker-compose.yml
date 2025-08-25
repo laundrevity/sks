@@ -11,13 +11,18 @@ services:
       - HOST=0.0.0.0
     ports:
       - "8000:8000"
+    # 👇 mount live source for dev
+    volumes:
+      - ./backend:/srv:rw
+      - api_data:/srv/data
+    # 👇 dev-friendly: auto-reload if watchfiles is available, else just run
+    command: sh -lc 'python -m watchfiles --filter python "python /srv/server.py" || python /srv/server.py'
 
   web:
     build:
       context: .
     image: sveltekit-dev:local
     working_dir: /app
-    # ⬇️ force vite to bind to all interfaces
     command: sh -lc 'npm run dev -- --host 0.0.0.0 --port 5173'
     ports:
       - "5173:5173"
@@ -35,4 +40,5 @@ services:
 
 volumes:
   node_modules_cache:
+  api_data:
 

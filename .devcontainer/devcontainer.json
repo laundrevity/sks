@@ -1,0 +1,38 @@
+{
+  "name": "SvelteKit + Python (multi-service)",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "web",
+  "runServices": ["web", "api"],
+  "workspaceFolder": "/app",
+  "remoteUser": "node",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "svelte.svelte-vscode",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "svelte.enable-ts-plugin": true,
+        "eslint.useFlatConfig": true,
+        "eslint.validate": ["typescript", "svelte"],
+        "prettier.requireConfig": true
+      }
+    }
+  },
+
+  "forwardPorts": [5173, 8000],
+  "portsAttributes": {
+    "5173": { "label": "Vite (web)" },
+    "8000": { "label": "API (aiohttp)" }
+  },
+
+  "postCreateCommand": "echo Dev container ready",
+  "shutdownAction": "stopCompose"
+}
+

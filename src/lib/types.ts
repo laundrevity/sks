@@ -1,5 +1,6 @@
 export type DeltaKind =
   | "response.status"
+  | "response.usage"
   | "item.started"
   | "item.completed"
   | "text"
@@ -21,4 +22,16 @@ export interface DeltaPayload {
   status: string | null;
   meta: Record<string, unknown>;
 }
+
+// ---- UI chat types (centralized so +page.svelte can import) ----
+export type Role = "user" | "assistant";
+
+export type TextPart = { type: "text"; text: string };
+export type ReasoningPart = { type: "reasoning"; text: string };
+export type FuncPart = { type: "function"; name: string; call_id: string; text: string };
+export type CustomPart = { type: "custom"; name: string; call_id: string; text: string };
+
+export type Part = TextPart | ReasoningPart | FuncPart | CustomPart;
+
+export type Msg = { id: string; role: Role; parts: Part[] };
 

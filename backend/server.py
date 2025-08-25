@@ -1,84 +1,125 @@
+# backend/server.py
 import os
 import json
 import asyncio
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionError
 
 from glial.agent import Agent
 from glial.streaming import Delta
+from storage import Storage
 
-# Keep per-session agents in memory (simple; swap for Redis if needed later)
-SESSIONS: Dict[str, Agent] = {}
+# --------------------------------------------------------------------------------------
+# Globals
+# --------------------------------------------------------------------------------------
+SESSIONS: Dict[str, Agent] = {}  # per-session agents in memory
+DB_PATH = os.getenv("DB_PATH", "./data/app.sqlite3")
+STORE = Storage(DB_PATH)
 
-
-# --- CORS utils --------------------------------------------------------------
-
+# --------------------------------------------------------------------------------------
+# CORS helpers
+# --------------------------------------------------------------------------------------
 def cors_headers_for(request: web.Request) -> dict:
     origin = request.headers.get("Origin", "*")
     return {
         "Access-Control-Allow-Origin": origin,
         "Vary": "Origin",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
         "Access-Control-Allow-Credentials": "true",
     }
 
-
 @web.middleware
 async def cors_mw(request, handler):
-    # Let normal JSON endpoints benefit from CORS via middleware
-    # (SSE will set headers inside handler before prepare()).
     if request.method == "OPTIONS":
-        # Short-circuit generic preflight
         return web.Response(status=204, headers=cors_headers_for(request))
-    resp = await handler(request)
-    # If handler already prepared the response (SSE), headers are already sent.
-    # For others, add CORS here:
+    try:
+        resp = await handler(request)
+    except web.HTTPException as ex:
+        for k, v in cors_headers_for(request).items():
+            ex.headers[k] = v
+        raise
     for k, v in cors_headers_for(request).items():
-        # don't overwrite if already set
         resp.headers.setdefault(k, v)
     return resp
 
-
-# --- Endpoints ---------------------------------------------------------------
-
+# --------------------------------------------------------------------------------------
+# Health
+# --------------------------------------------------------------------------------------
 async def health(_request: web.Request):
     return web.json_response({"ok": True})
 
+# --------------------------------------------------------------------------------------
+# Conversations API
+# --------------------------------------------------------------------------------------
+async def list_conversations(request: web.Request):
+    limit = int(request.query.get("limit", "50"))
+    offset = int(request.query.get("offset", "0"))
+    data = STORE.list_conversations(limit=limit, offset=offset)
+    return web.json_response({"conversations": data})
 
-async def options_stream(request: web.Request):
-    # Dedicated preflight that doesn't try to parse JSON, avoids 400s
-    headers = cors_headers_for(request)
-    headers["Content-Length"] = "0"
-    return web.Response(status=204, headers=headers)
+async def create_conversation(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    title = body.get("title")
+    settings = body.get("settings")
+    conv_id = STORE.create_conversation(title=title, settings=settings)
+    conv = STORE.get_conversation(conv_id) or {"id": conv_id, "title": title}
+    return web.json_response(conv, status=201)
 
+async def get_conversation(request: web.Request):
+    conv_id = request.match_info["conv_id"]
+    conv = STORE.get_conversation(conv_id)
+    if not conv:
+        raise web.HTTPNotFound(
+            text=json.dumps({"error": "not found"}),
+            content_type="application/json",
+        )
+    return web.json_response(conv)
 
-async def stream_chat(request: web.Request):
-    """
-    POST /v1/stream
-    body: { "prompt": "...", "session": "optional-id" }
-    streams: SSE events with lines:
-       event: <kind>\n
-       data: <json>\n
-       \n
-    """
+async def patch_conversation(request: web.Request):
+    conv_id = request.match_info["conv_id"]
+    conv = STORE.get_conversation(conv_id)
+    if not conv:
+        raise web.HTTPNotFound(
+            text=json.dumps({"error": "not found"}),
+            content_type="application/json",
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    title = body.get("title", None)
+    settings = body.get("settings", None)
+
+    updates = []
+    params: list[Any] = []
+    if title is not None:
+        updates.append("title=?")
+        params.append(title)
+    if settings is not None:
+        updates.append("settings=?")
+        params.append(json.dumps(settings, ensure_ascii=False))
+    if updates:
+        import time as _t
+        updates.append("updated_at=?")
+        params.append(int(_t.time()))
+        STORE.conn.execute(f"UPDATE conversations SET {', '.join(updates)} WHERE id=?", (*params, conv_id))
+
+    conv2 = STORE.get_conversation(conv_id) or {"id": conv_id, "title": title}
+    return web.json_response(conv2)
+
+# --------------------------------------------------------------------------------------
+# Shared SSE streaming helper
+# --------------------------------------------------------------------------------------
+async def _stream_round(request: web.Request, session_id: str, prompt: str, conv_id: Optional[str] = None):
     if os.getenv("OPENAI_API_KEY", "").strip() == "":
         return web.json_response({"error": "OPENAI_API_KEY not set"}, status=500)
 
-    # Parse body (don’t assume preflight comes here; OPTIONS handled earlier)
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid json"}, status=400)
-
-    prompt = (data.get("prompt") or "").strip()
-    session_id = (data.get("session") or "default").strip() or "default"
-    if not prompt:
-        return web.json_response({"error": "prompt required"}, status=400)
-
-    # Prepare SSE response. IMPORTANT: set CORS headers BEFORE prepare()
     resp = web.StreamResponse(
         status=200,
         reason="OK",
@@ -86,20 +127,22 @@ async def stream_chat(request: web.Request):
             "Content-Type": "text/event-stream; charset=utf-8",
             "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # don't let proxies buffer
+            "X-Accel-Buffering": "no",
             **cors_headers_for(request),
         },
     )
     await resp.prepare(request)
 
-    # Track if the client bailed to stop writing further
     client_open = True
+    saw_any_stream = False
+    saw_completed = False
 
-    # Delta -> SSE writer
     async def emit(d: Delta):
-        nonlocal client_open
+        nonlocal client_open, saw_any_stream, saw_completed
         if not client_open:
             return
+
+        # Proxy upstream deltas to the client
         payload = {
             "kind": d.kind,
             "output_index": d.output_index,
@@ -112,40 +155,70 @@ async def stream_chat(request: web.Request):
             "status": d.status,
             "meta": d.meta or {},
         }
+
         try:
             await resp.write(f"event: {d.kind}\n".encode("utf-8"))
             await resp.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8"))
+            saw_any_stream = True
+            if d.kind == "response.status" and d.status == "completed":
+                saw_completed = True
         except (ConnectionResetError, ClientConnectionError, RuntimeError):
-            # Transport closed or response finished; stop emitting
             client_open = False
 
-    # Get or create agent for this session; ensure it uses THIS request's emitter
+    # get or create agent; seed from DB if conv-based and first time
     agent = SESSIONS.get(session_id)
     if agent is None:
         agent = Agent(on_delta=emit)
-        await agent.__aenter__()  # open aiohttp.ClientSession inside Agent
+        await agent.__aenter__()
+        if conv_id:
+            try:
+                agent.items = STORE.get_items_for_agent(conv_id)
+            except Exception:
+                agent.items = []
         SESSIONS[session_id] = agent
     else:
-        # <-- THIS fixes "first request works, second doesn't"
-        agent.on_delta = emit
+        agent.on_delta = emit  # rebind per-HTTP-connection
 
     try:
-        # Trigger the whole tool/function loop and conversation persistence
-        await agent(prompt)
+        ret = await agent(prompt)
+
+        total_tokens: Optional[int] = None
+        new_items: Optional[list] = None
+        if isinstance(ret, dict):
+            total_tokens = ret.get("total_tokens")
+            new_items = ret.get("new_items")
+        else:
+            total_tokens = ret
+
+        if conv_id and new_items:
+            try:
+                STORE.append_messages(conv_id, new_items)
+            except Exception:
+                # don't break streaming on persistence errors
+                pass
+
+        if client_open and total_tokens is not None:
+            usage_payload = {"kind": "response.usage", "total_tokens": total_tokens}
+            try:
+                await resp.write(b"event: response.usage\n")
+                await resp.write(f"data: {json.dumps(usage_payload, ensure_ascii=False)}\n\n".encode("utf-8"))
+            except (ConnectionResetError, ClientConnectionError, RuntimeError):
+                client_open = False
+
     except asyncio.CancelledError:
-        # client disconnected
+        # client disconnected mid-stream
         pass
     except Exception as e:
-        # Surface as an SSE 'error' event (best-effort)
-        err = {"message": str(e)}
-        try:
-            if client_open:
+        # Only surface as SSE 'error' if we haven't already completed or streamed output
+        if client_open and not saw_completed and not saw_any_stream:
+            err = {"message": str(e)}
+            try:
                 await resp.write(b"event: error\n")
                 await resp.write(f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode("utf-8"))
-        except Exception:
-            pass
+            except Exception:
+                pass
+        # otherwise, swallow the error to avoid noisy bubbles for harmless post-completion issues
     finally:
-        # End the SSE stream cleanly
         try:
             await resp.write_eof()
         except Exception:
@@ -153,16 +226,64 @@ async def stream_chat(request: web.Request):
 
     return resp
 
+# --------------------------------------------------------------------------------------
+# Stream endpoints
+# --------------------------------------------------------------------------------------
+async def stream_chat(request: web.Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
 
+    prompt = (data.get("prompt") or "").strip()
+    session_id = (data.get("session") or "default").strip() or "default"
+    if not prompt:
+        return web.json_response({"error": "prompt required"}, status=400)
+
+    return await _stream_round(request, session_id=session_id, prompt=prompt, conv_id=None)
+
+async def stream_chat_conversation(request: web.Request):
+    conv_id = request.match_info["conv_id"]
+    if not STORE.get_conversation(conv_id):
+        raise web.HTTPNotFound(
+            text=json.dumps({"error": "not found"}),
+            content_type="application/json",
+        )
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return web.json_response({"error": "prompt required"}, status=400)
+
+    return await _stream_round(request, session_id=conv_id, prompt=prompt, conv_id=conv_id)
+
+# --------------------------------------------------------------------------------------
+# App wiring
+# --------------------------------------------------------------------------------------
 def create_app():
     app = web.Application(middlewares=[cors_mw])
     app.add_routes([
         web.get("/healthz", health),
-        web.options("/v1/stream", options_stream),  # clean preflight
+
+        # Conversations
+        web.get("/v1/conversations", list_conversations),
+        web.post("/v1/conversations", create_conversation),
+        web.get("/v1/conversations/{conv_id}", get_conversation),
+        web.patch("/v1/conversations/{conv_id}", patch_conversation),
+
+        # Streaming (session-scoped)
         web.post("/v1/stream", stream_chat),
+        web.options("/v1/stream", stream_chat),
+
+        # Streaming (conversation-scoped)
+        web.post("/v1/conversations/{conv_id}/stream", stream_chat_conversation),
+        web.options("/v1/conversations/{conv_id}/stream", stream_chat_conversation),
     ])
     return app
-
 
 if __name__ == "__main__":
     web.run_app(
